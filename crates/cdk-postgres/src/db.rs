@@ -1,6 +1,7 @@
 use cdk_common::database::Error;
 use cdk_sql_common::run_db_operation;
 use cdk_sql_common::stmt::{Column, Statement};
+use futures_util::future::{try_join, try_join_all};
 use futures_util::{pin_mut, TryStreamExt};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Error as PgError};
@@ -51,6 +52,55 @@ pub async fn pg_execute(conn: &Client, statement: Statement) -> Result<usize, Er
         to_pgsql_error,
     )
     .await
+}
+
+/// Runs `statements`, then COMMIT, sent to Postgres in one go. Each statement is prepared first;
+/// then their executions and the COMMIT go out together, without waiting for each reply in turn
+/// (tokio-postgres pipelines requests polled together, in the order they're polled). Postgres
+/// runs them in that order, so a row lock a statement takes is held only until the COMMIT right
+/// behind it, with no round trip in between. If a statement fails, Postgres aborts the
+/// transaction and answers the COMMIT with a rollback, and the statement's error is returned.
+pub async fn pg_execute_then_commit(
+    conn: &Client,
+    statements: Vec<Statement>,
+) -> Result<(), Error> {
+    // `try_join_all` polls up to 30 futures in order, and so sends their requests in order;
+    // beyond that it doesn't promise to. A transaction has one statement per keyset it touched,
+    // so this is only a safeguard.
+    const PIPELINED_MAX: usize = 30;
+    if statements.len() > PIPELINED_MAX {
+        for statement in statements {
+            pg_execute(conn, statement).await?;
+        }
+        return run_db_operation("COMMIT", conn.batch_execute("COMMIT"), to_pgsql_error).await;
+    }
+
+    let mut prepared = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let (sql, placeholder_values) = statement.to_sql()?;
+        let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+        prepared.push((sql, prepared_statement, placeholder_values));
+    }
+
+    let executions = prepared
+        .iter()
+        .map(|(sql, prepared_statement, placeholder_values)| {
+            run_db_operation(
+                sql,
+                conn.execute_raw(
+                    prepared_statement,
+                    placeholder_values
+                        .iter()
+                        .map(|x| x.into())
+                        .collect::<Vec<PgValue>>(),
+                ),
+                to_pgsql_error,
+            )
+        });
+    let commit = run_db_operation("COMMIT", conn.batch_execute("COMMIT"), to_pgsql_error);
+
+    try_join(try_join_all(executions), commit).await?;
+    Ok(())
 }
 
 #[inline(always)]

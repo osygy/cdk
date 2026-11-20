@@ -6,12 +6,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cdk_common::database::Error;
-use cdk_sql_common::database::{DatabaseConnector, DatabaseExecutor, GenericTransactionHandler};
+use cdk_sql_common::database::{
+    DatabaseConnector, DatabaseExecutor, DatabaseTransaction, GenericTransactionHandler,
+};
 use cdk_sql_common::mint::SQLMintAuthDatabase;
 use cdk_sql_common::pool::{DatabaseConfig, DatabasePool};
 use cdk_sql_common::stmt::{Column, Statement};
 use cdk_sql_common::{SQLMintDatabase, SQLWalletDatabase};
-use db::{pg_batch, pg_execute, pg_fetch_all, pg_fetch_one, pg_pluck};
+use db::{pg_batch, pg_execute, pg_execute_then_commit, pg_fetch_all, pg_fetch_one, pg_pluck};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 use tokio_postgres::{Client, Error as PgError, NoTls};
@@ -316,7 +318,38 @@ impl PostgresConnection {
 
 #[async_trait::async_trait]
 impl DatabaseConnector for PostgresConnection {
-    type Transaction = GenericTransactionHandler<Self>;
+    type Transaction = PostgresTransactionHandler;
+}
+
+/// Transactions on Postgres: begun, committed and rolled back as on any database, except that
+/// the statements run just before COMMIT go out with it, in one round trip (see
+/// `pg_execute_then_commit` in `db.rs`).
+#[allow(missing_debug_implementations)]
+pub struct PostgresTransactionHandler;
+
+#[async_trait::async_trait]
+impl DatabaseTransaction<PostgresConnection> for PostgresTransactionHandler {
+    async fn commit(conn: &mut PostgresConnection) -> Result<(), Error> {
+        GenericTransactionHandler::<PostgresConnection>::commit(conn).await
+    }
+
+    async fn commit_after(
+        conn: &mut PostgresConnection,
+        statements: Vec<Statement>,
+    ) -> Result<(), Error> {
+        if statements.is_empty() {
+            return Self::commit(conn).await;
+        }
+        pg_execute_then_commit(conn.inner().await?, statements).await
+    }
+
+    async fn begin(conn: &mut PostgresConnection) -> Result<(), Error> {
+        GenericTransactionHandler::<PostgresConnection>::begin(conn).await
+    }
+
+    async fn rollback(conn: &mut PostgresConnection) -> Result<(), Error> {
+        GenericTransactionHandler::<PostgresConnection>::rollback(conn).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -409,6 +442,70 @@ mod test {
             .await
             .expect("regular transaction");
         regular.rollback().await.expect("regular rollback");
+    }
+
+    /// `commit_after` sends its statements with the COMMIT. All of the transaction commits, or
+    /// none of it: a failing statement's error comes back, and the connection serves the next
+    /// transaction. With a pool of one, that next one gets the same connection.
+    #[tokio::test]
+    async fn commit_after_commits_all_or_nothing() {
+        use cdk_sql_common::database::ConnectionWithTransaction;
+        use cdk_sql_common::pool::Pool;
+        use cdk_sql_common::stmt::query;
+
+        let test_id = format!("test_commit_after_{}", uuid::Uuid::new_v4().simple());
+        let db_url = std::env::var("CDK_MINTD_DATABASE_URL")
+            .or_else(|_| std::env::var("PG_DB_URL"))
+            .unwrap_or(
+                "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
+                    .to_owned(),
+            );
+        let pool = Pool::<PgConnectionPool>::new(PgConfig::new(
+            &format!("{db_url} schema={test_id}"),
+            None,
+            Some(1),
+            Some(10),
+        ));
+        let insert = |id: i64| {
+            query("INSERT INTO t (id) VALUES (:id)")
+                .expect("statement")
+                .bind("id", id)
+        };
+
+        let conn = pool.get().await.expect("connection");
+        query("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+            .expect("statement")
+            .batch(&*conn)
+            .await
+            .expect("table");
+        drop(conn);
+
+        let tx = ConnectionWithTransaction::new(pool.get().await.expect("connection"))
+            .await
+            .expect("begin");
+        insert(1).execute(&tx).await.expect("insert");
+        tx.commit_after(vec![insert(2), insert(3)])
+            .await
+            .expect("commit");
+
+        // 1 is taken, so the second statement fails, and 4 and 5 roll back with it.
+        let tx = ConnectionWithTransaction::new(pool.get().await.expect("connection"))
+            .await
+            .expect("begin");
+        insert(4).execute(&tx).await.expect("insert");
+        let err = tx
+            .commit_after(vec![insert(5), insert(1)])
+            .await
+            .expect_err("a duplicate key");
+        assert!(matches!(err, Error::Duplicate), "{err:?}");
+
+        let conn = pool.get().await.expect("the same connection, rolled back");
+        let rows = query("SELECT id FROM t ORDER BY id")
+            .expect("statement")
+            .fetch_all(&*conn)
+            .await
+            .expect("select");
+        assert_eq!(rows.len(), 3, "only 1, 2 and 3 are committed: {rows:?}");
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ use cdk_common::QuoteId;
 use crate::common::migrate;
 use crate::database::{ConnectionWithTransaction, DatabaseExecutor};
 use crate::pool::{DatabasePool, Pool, PooledResource};
-use crate::stmt::query;
+use crate::stmt::{query, Statement};
 
 mod auth;
 mod completed_operations;
@@ -159,14 +159,16 @@ where
         delta.fee_collected += fee_collected;
     }
 
-    /// Writes the recorded totals, one upsert per keyset. The map is ordered by keyset ID, so
-    /// concurrent transactions lock shared rows in the same order and can't deadlock.
-    async fn flush_keyset_deltas(&mut self) -> Result<(), Error> {
+    /// The upserts that write the recorded totals, one per keyset, to run just before COMMIT
+    /// and with it. The map is ordered by keyset ID, so concurrent transactions lock shared rows
+    /// in the same order and can't deadlock.
+    fn keyset_delta_statements(&mut self) -> Result<Vec<Statement>, Error> {
+        let mut statements = Vec::new();
         for (keyset_id, delta) in std::mem::take(&mut self.keyset_deltas) {
             if delta.issued == 0 && delta.redeemed == 0 && delta.fee_collected == 0 {
                 continue;
             }
-            query(
+            let statement = query(
                 r#"
                 INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, fee_collected)
                 VALUES (:keyset_id, :issued, :redeemed, :fee_collected)
@@ -180,11 +182,10 @@ where
             .bind("keyset_id", keyset_id)
             .bind("issued", delta.issued)
             .bind("redeemed", delta.redeemed)
-            .bind("fee_collected", delta.fee_collected)
-            .execute(&self.inner)
-            .await?;
+            .bind("fee_collected", delta.fee_collected);
+            statements.push(statement);
         }
-        Ok(())
+        Ok(statements)
     }
 }
 
@@ -209,9 +210,10 @@ where
         #[cfg(feature = "prometheus")]
         let metrics = MintMetricGuard::new("transaction_commit");
 
-        // On an error, dropping the transaction rolls it back.
-        let result = match self.flush_keyset_deltas().await {
-            Ok(()) => self.inner.commit().await,
+        // The totals go with the COMMIT, so their row stays locked for as little as the
+        // database allows. On an error, dropping the transaction rolls it back.
+        let result = match self.keyset_delta_statements() {
+            Ok(statements) => self.inner.commit_after(statements).await,
             Err(err) => Err(err),
         };
 

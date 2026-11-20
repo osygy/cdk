@@ -49,6 +49,19 @@ where
     /// Consumes the current transaction committing the changes
     async fn commit(conn: &mut DB) -> Result<(), Error>;
 
+    /// Runs `statements`, then commits. If a statement fails, nothing is committed and its error
+    /// is returned.
+    ///
+    /// The default runs them one at a time, then [`Self::commit`]. A backend that can send them
+    /// with the COMMIT in one go overrides it: a row lock one of them takes is then held only
+    /// while the database works, not across round trips back to this process.
+    async fn commit_after(conn: &mut DB, statements: Vec<Statement>) -> Result<(), Error> {
+        for statement in statements {
+            conn.execute(statement).await?;
+        }
+        Self::commit(conn).await
+    }
+
     /// Begin a transaction
     async fn begin(conn: &mut DB) -> Result<(), Error>;
 
@@ -104,6 +117,20 @@ where
             .ok_or(Error::Internal("Missing connection".to_owned()))?;
 
         DB::Transaction::commit(conn.deref_mut()).await?;
+        self.inner.take();
+
+        Ok(())
+    }
+
+    /// Runs `statements`, then commits the transaction, consuming it (see
+    /// [`DatabaseTransaction::commit_after`]). On an error, dropping it rolls it back.
+    pub async fn commit_after(mut self, statements: Vec<Statement>) -> Result<(), Error> {
+        let conn = self
+            .inner
+            .as_mut()
+            .ok_or(Error::Internal("Missing connection".to_owned()))?;
+
+        DB::Transaction::commit_after(conn.deref_mut(), statements).await?;
         self.inner.take();
 
         Ok(())
@@ -271,8 +298,9 @@ where
 /// Database connector
 #[async_trait::async_trait]
 pub trait DatabaseConnector: Debug + DatabaseExecutor + Send + Sync {
-    /// Database static trait for the database
-    type Transaction: DatabaseTransaction<Self>
+    /// Database static trait for the database. `Send`, so [`DatabaseTransaction`]'s default
+    /// methods can be awaited across threads.
+    type Transaction: DatabaseTransaction<Self> + Send
     where
         Self: Sized;
 }
