@@ -65,19 +65,28 @@ impl Service {
     ) {
         while let Some(request) = receiver.recv().await {
             match request {
+                // Signing and checking run in their own tasks, so they use every core instead of
+                // one request at a time. The signatory is safe to call concurrently: the remote
+                // signatory's gRPC server already does. Keyset requests stay in order, here.
                 Request::BlindSign((blinded_message, response)) => {
-                    let output = handler.blind_sign(blinded_message).await;
-                    if response.send(output).is_err() {
-                        tracing::error!("Error sending blind-sign response: receiver dropped");
-                    }
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        let output = handler.blind_sign(blinded_message).await;
+                        if response.send(output).is_err() {
+                            tracing::error!("Error sending blind-sign response: receiver dropped");
+                        }
+                    });
                 }
                 Request::VerifyProof((proof, response)) => {
-                    let output = handler.verify_proofs(proof).await;
-                    if response.send(output).is_err() {
-                        tracing::error!(
-                            "Error sending proof-verification response: receiver dropped"
-                        );
-                    }
+                    let handler = handler.clone();
+                    tokio::spawn(async move {
+                        let output = handler.verify_proofs(proof).await;
+                        if response.send(output).is_err() {
+                            tracing::error!(
+                                "Error sending proof-verification response: receiver dropped"
+                            );
+                        }
+                    });
                 }
                 Request::Keysets(response) => {
                     let output = handler.keysets().await;
