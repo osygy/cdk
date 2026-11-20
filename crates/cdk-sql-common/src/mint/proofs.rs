@@ -134,10 +134,14 @@ where
     ) -> Result<Acquired<ProofsWithState>, Self::Err> {
         let current_time = unix_time();
 
-        let mut ordered_proofs = proofs
+        // Each proof's Y, computed once here: the returned proofs carry them, so the state
+        // updates that follow don't hash to the curve again.
+        let ys = proofs.ys()?;
+        let mut ordered_proofs = ys
             .iter()
-            .map(|proof| Ok((proof.y()?.to_bytes().to_vec(), proof)))
-            .collect::<Result<Vec<_>, Error>>()?;
+            .zip(proofs.iter())
+            .map(|(y, proof)| (y.to_bytes().to_vec(), proof))
+            .collect::<Vec<_>>();
         ordered_proofs.sort_unstable_by(|(left_y, _), (right_y, _)| left_y.cmp(right_y));
 
         // Check any previous proof, this query should return None in order to proceed storing
@@ -201,7 +205,7 @@ where
             stmt.execute(&self.inner).await?;
         }
 
-        Ok(ProofsWithState::new(proofs, State::Unspent).into())
+        Ok(ProofsWithState::new(proofs, ys, State::Unspent).into())
     }
 
     /// Updates all proofs to the given state in the database.
@@ -221,7 +225,7 @@ where
         proofs: &mut Acquired<ProofsWithState>,
         new_state: State,
     ) -> Result<(), Self::Err> {
-        let ys = proofs.ys()?;
+        let ys = proofs.ys();
 
         query(r#"UPDATE proof SET state = :new_state WHERE y IN (:ys)"#)?
             .bind("new_state", new_state.to_string())
@@ -322,14 +326,12 @@ where
         &mut self,
         quote_id: &QuoteId,
     ) -> Result<Vec<PublicKey>, Self::Err> {
+        // The Ys are the table's key: read them, rather than each proof's secret to hash to the
+        // curve again. The same rows, locked in the same order.
         Ok(query(
             r#"
             SELECT
-                amount,
-                keyset_id,
-                secret,
-                c,
-                witness
+                y
             FROM
                 proof
             WHERE
@@ -342,9 +344,14 @@ where
         .fetch_all(&self.inner)
         .await?
         .into_iter()
-        .map(sql_row_to_proof)
-        .collect::<Result<Vec<Proof>, _>>()?
-        .ys()?)
+        .map(|row| -> Result<PublicKey, Error> {
+            Ok(column_as_string!(
+                &row[0],
+                PublicKey::from_hex,
+                PublicKey::from_slice
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?)
     }
 
     async fn get_proof_ys_by_operation_id(
@@ -426,8 +433,14 @@ where
             proofs.push(proof);
         }
 
+        // The rows come back ORDER BY y, which compares the bytes, and there's one for each of
+        // the caller's Ys (checked above), so the Ys sorted by their bytes are the rows' Ys in
+        // order: no need to hash each secret to the curve again.
+        let mut ys = ys.to_vec();
+        ys.sort_unstable_by_key(|y| y.to_bytes());
+
         let state = first_state.unwrap_or(State::Unspent);
-        Ok(ProofsWithState::new(proofs, state).into())
+        Ok(ProofsWithState::new(proofs, ys, state).into())
     }
 }
 

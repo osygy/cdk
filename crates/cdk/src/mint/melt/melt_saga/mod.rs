@@ -7,8 +7,7 @@ use cdk_common::nut00::KnownMethod;
 use cdk_common::nuts::MeltQuoteState;
 use cdk_common::payment::OutgoingPaymentOptions;
 use cdk_common::{
-    Amount, CurrencyUnit, Error, ProofsMethods, PublicKey, QuoteId, SpendingConditionVerification,
-    State,
+    Amount, CurrencyUnit, Error, PublicKey, QuoteId, SpendingConditionVerification, State,
 };
 #[cfg(feature = "prometheus")]
 use cdk_prometheus::MintMetricGuard;
@@ -252,7 +251,7 @@ impl MeltSaga<Initial> {
         );
 
         // Add proofs to the database
-        if let Err(err) = tx
+        let input_ys = match tx
             .add_proofs(
                 melt_request.inputs().clone(),
                 Some(melt_request.quote_id().to_owned()),
@@ -260,15 +259,19 @@ impl MeltSaga<Initial> {
             )
             .await
         {
-            tx.rollback().await?;
-            return Err(match err {
-                cdk_common::database::Error::Duplicate => Error::TokenPending,
-                cdk_common::database::Error::AttemptUpdateSpentProof => Error::TokenAlreadySpent,
-                err => Error::Database(err),
-            });
-        }
-
-        let input_ys = melt_request.inputs().ys()?;
+            // Computed by add_proofs, in the inputs' order.
+            Ok(added) => added.ys().to_vec(),
+            Err(err) => {
+                tx.rollback().await?;
+                return Err(match err {
+                    cdk_common::database::Error::Duplicate => Error::TokenPending,
+                    cdk_common::database::Error::AttemptUpdateSpentProof => {
+                        Error::TokenAlreadySpent
+                    }
+                    err => Error::Database(err),
+                });
+            }
+        };
 
         let mut proofs = tx.get_proofs(&input_ys).await?;
 

@@ -350,6 +350,7 @@ macro_rules! mint_db_test {
             $make_db_fn,
             add_and_find_proofs,
             add_many_proofs,
+            proofs_carry_their_ys,
             add_duplicate_proofs,
             kvstore_functionality,
             kvstore_write_if_absent,

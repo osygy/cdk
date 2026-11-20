@@ -45,10 +45,13 @@ impl Mint {
     pub fn check_inputs_unique(inputs: &Proofs) -> Result<(), Error> {
         let proof_count = inputs.len();
 
+        // A proof's Y is the hash of its secret to the curve, so two inputs have the same Y
+        // exactly when they have the same secret: compare the secrets, and leave computing the
+        // Ys to the one place that needs them (`add_proofs`).
         if inputs
             .iter()
-            .map(|i| i.y())
-            .collect::<Result<HashSet<PublicKey>, _>>()?
+            .map(|i| i.secret.as_bytes())
+            .collect::<HashSet<&[u8]>>()
             .len()
             .ne(&proof_count)
         {

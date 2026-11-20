@@ -73,6 +73,9 @@ pub enum OperationKind {
 #[derive(Debug)]
 pub struct ProofsWithState {
     proofs: Proofs,
+    /// Each proof's Y, in the same order as `proofs`. Computing a Y is a hash to the curve, so
+    /// it's done once, by whoever builds this, and not on every use.
+    ys: Vec<PublicKey>,
     /// The current state of the proofs
     pub state: State,
 }
@@ -92,11 +95,27 @@ impl ProofsWithState {
     ///
     /// This constructor assumes all proofs share the given state. It is typically
     /// called by the database layer after verifying state consistency.
-    pub fn new(proofs: Proofs, current_state: State) -> Self {
+    ///
+    /// `ys[i]` must be `proofs[i]`'s Y. Debug builds check it.
+    pub fn new(proofs: Proofs, ys: Vec<PublicKey>, current_state: State) -> Self {
+        debug_assert_eq!(proofs.len(), ys.len(), "one Y for each proof");
+        debug_assert!(
+            proofs
+                .iter()
+                .zip(&ys)
+                .all(|(proof, y)| proof.y().ok().as_ref() == Some(y)),
+            "each Y is its proof's"
+        );
         Self {
             proofs,
+            ys,
             state: current_state,
         }
+    }
+
+    /// Each proof's Y, in the same order as the proofs, without computing them again.
+    pub fn ys(&self) -> &[PublicKey] {
+        &self.ys
     }
 }
 

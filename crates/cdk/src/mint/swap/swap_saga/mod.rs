@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::mint::{Operation, Saga, SwapSagaState};
 use cdk_common::nuts::BlindedMessage;
-use cdk_common::{database, Error, Proofs, ProofsMethods, PublicKey, QuoteId, State};
+use cdk_common::{database, Error, Proofs, PublicKey, QuoteId, State};
 use tracing::instrument;
 
 use self::compensation::{CompensatingAction, RemoveSwapSetup};
@@ -197,10 +197,8 @@ impl<'a> SwapSaga<'a, Initial> {
             }
         };
 
-        let ys = match input_proofs.ys() {
-            Ok(ys) => ys,
-            Err(err) => return Err(Error::NUT00(err)),
-        };
+        // Computed by add_proofs, in the inputs' order.
+        let ys = new_proofs.ys().to_vec();
 
         if let Err(err) = Mint::update_proofs_state(&mut tx, &mut new_proofs, State::Pending).await
         {

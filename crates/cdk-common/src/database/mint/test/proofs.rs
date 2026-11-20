@@ -121,6 +121,72 @@ where
     assert_eq!(proofs_from_db.unwrap().len(), 2);
 }
 
+/// The proofs that add_proofs and get_proofs return carry each proof's Y, in the proofs' order,
+/// whatever order get_proofs is given the Ys in.
+pub async fn proofs_carry_their_ys<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let keyset_id = setup_keyset(&db).await;
+    let quote_id = QuoteId::new();
+
+    let proofs = (0..20u64)
+        .map(|i| Proof {
+            amount: Amount::from(i + 1),
+            keyset_id,
+            secret: Secret::generate(),
+            c: SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        })
+        .collect::<Vec<_>>();
+    let ys = proofs.iter().map(|p| p.y().unwrap()).collect::<Vec<_>>();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let added = tx
+        .add_proofs(
+            proofs.clone(),
+            Some(quote_id.clone()),
+            &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        added.ys(),
+        ys.as_slice(),
+        "add_proofs keeps the given order"
+    );
+    tx.commit().await.unwrap();
+
+    // Asked for in reverse: the rows come back in y order, each with its own Y.
+    let reversed = ys.iter().rev().cloned().collect::<Vec<_>>();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut fetched = tx.get_proofs(&reversed).await.unwrap();
+    assert_eq!(fetched.len(), 20);
+    assert_eq!(fetched.ys().len(), 20);
+    for (proof, y) in fetched.iter().zip(fetched.ys()) {
+        assert_eq!(&proof.y().unwrap(), y);
+    }
+
+    // And the state update uses them.
+    tx.update_proofs_state(&mut fetched, State::Pending)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let states = db.get_proofs_states(&ys).await.unwrap();
+    assert!(states.iter().all(|s| *s == Some(State::Pending)));
+
+    // A melt's finalize reads the Ys by quote: the same ones.
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let mut by_quote = tx.get_proof_ys_by_quote_id(&quote_id).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut expected = ys.clone();
+    by_quote.sort_unstable_by_key(|y| y.to_bytes());
+    expected.sort_unstable_by_key(|y| y.to_bytes());
+    assert_eq!(by_quote, expected);
+}
+
 /// Test adding more proofs than fit in one multi-row statement
 pub async fn add_many_proofs<DB>(db: DB)
 where
