@@ -352,12 +352,45 @@ impl SwapSaga<'_, Signed> {
     /// - Propagates any database errors
     #[instrument(skip_all)]
     pub async fn finalize(mut self) -> Result<cdk_common::nuts::SwapResponse, Error> {
+        // Any error from TX2 undoes the setup, including failing to begin or commit the
+        // transaction (a busy database's pool timing out, say): otherwise the inputs would stay
+        // pending until recovery at the next start.
+        if let Err(err) = self.commit_finalization().await {
+            self.compensate_all().await?;
+            return Err(err);
+        }
+
+        // Publish proof state changes
+        for pk in &self.state_data.ys {
+            self.pubsub.proof_state((*pk, State::Spent));
+        }
+        // Clear compensations - swap is complete
+        self.compensations.clear();
+
+        Ok(cdk_common::nuts::SwapResponse::new(
+            self.state_data.signatures,
+        ))
+    }
+
+    /// TX2: adds the signatures, marks the inputs spent and deletes the saga record, in one
+    /// transaction. On an error, the transaction is rolled back and [`Self::finalize`]
+    /// compensates.
+    async fn commit_finalization(&self) -> Result<(), Error> {
         let blinded_secrets: Vec<PublicKey> = self
             .state_data
             .blinded_messages
             .iter()
             .map(|bm| bm.blinded_secret)
             .collect();
+
+        #[cfg(test)]
+        {
+            if crate::test_helpers::mint::should_fail_for("BEGIN_FINALIZE") {
+                return Err(Error::Database(database::Error::Database(
+                    "Test failure: BEGIN_FINALIZE".into(),
+                )));
+            }
+        }
 
         let mut tx = self.db.begin_transaction().await?;
 
@@ -368,7 +401,6 @@ impl SwapSaga<'_, Signed> {
         {
             if crate::test_helpers::mint::should_fail_for("ADD_SIGNATURES") {
                 tx.rollback().await?;
-                self.compensate_all().await?;
                 return Err(Error::Database(database::Error::Database(
                     "Test failure: ADD_SIGNATURES".into(),
                 )));
@@ -380,7 +412,6 @@ impl SwapSaga<'_, Signed> {
             .await
         {
             tx.rollback().await?;
-            self.compensate_all().await?;
             return Err(err.into());
         }
 
@@ -391,7 +422,6 @@ impl SwapSaga<'_, Signed> {
         {
             if crate::test_helpers::mint::should_fail_for("UPDATE_PROOFS") {
                 tx.rollback().await?;
-                self.compensate_all().await?;
                 return Err(Error::Database(database::Error::Database(
                     "Test failure: UPDATE_PROOFS".into(),
                 )));
@@ -402,14 +432,12 @@ impl SwapSaga<'_, Signed> {
             Ok(proofs) => proofs,
             Err(err) => {
                 tx.rollback().await?;
-                self.compensate_all().await?;
                 return Err(err.into());
             }
         };
 
         if let Err(err) = Mint::update_proofs_state(&mut tx, &mut proofs, State::Spent).await {
             tx.rollback().await?;
-            self.compensate_all().await?;
             return Err(err);
         }
 
@@ -421,7 +449,6 @@ impl SwapSaga<'_, Signed> {
             .await
         {
             tx.rollback().await?;
-            self.compensate_all().await?;
             return Err(err.into());
         }
 
@@ -436,17 +463,19 @@ impl SwapSaga<'_, Signed> {
             // Don't rollback - swap succeeded, orphaned saga is harmless
         }
 
-        tx.commit().await?;
-        // Publish proof state changes
-        for pk in &self.state_data.ys {
-            self.pubsub.proof_state((*pk, State::Spent));
+        #[cfg(test)]
+        {
+            if crate::test_helpers::mint::should_fail_for("COMMIT_FINALIZE") {
+                tx.rollback().await?;
+                return Err(Error::Database(database::Error::Database(
+                    "Test failure: COMMIT_FINALIZE".into(),
+                )));
+            }
         }
-        // Clear compensations - swap is complete
-        self.compensations.clear();
 
-        Ok(cdk_common::nuts::SwapResponse::new(
-            self.state_data.signatures,
-        ))
+        tx.commit().await?;
+
+        Ok(())
     }
 }
 
@@ -465,6 +494,7 @@ impl<S> SwapSaga<'_, S> {
 
         tracing::warn!("Running {} compensating actions", compensations.len());
 
+        let mut failed = VecDeque::new();
         while let Some(compensation) = compensations.pop_front() {
             tracing::debug!("Running compensation: {}", compensation.name());
             if let Err(e) = compensation.execute(&self.db, &self.pubsub).await {
@@ -473,7 +503,19 @@ impl<S> SwapSaga<'_, S> {
                     compensation.name(),
                     e
                 );
+                failed.push_back(compensation);
             }
+        }
+
+        // A compensation mostly fails because the database is too busy for now, which is often
+        // why the saga failed too. Keep trying in the background, rather than leave the inputs
+        // pending until recovery at the next start.
+        if !failed.is_empty() {
+            cdk_common::task::spawn(compensation::retry_in_background(
+                failed,
+                self.db,
+                self.pubsub,
+            ));
         }
 
         Ok(())

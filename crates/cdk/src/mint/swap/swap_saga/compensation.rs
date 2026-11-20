@@ -1,3 +1,7 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use cdk_common::database::DynMintDatabase;
 use cdk_common::{Error, PublicKey};
@@ -5,6 +9,15 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::mint::subscription::PubSubManager;
+
+/// How many times a compensation that failed is retried before it's left to recovery at the
+/// next start.
+const RETRIES: u32 = 10;
+/// The wait before the first retry. It doubles each time, up to [`MAX_RETRY_DELAY`]: about
+/// 2.5 minutes in all.
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// The longest wait between two retries.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait CompensatingAction: Send + Sync {
@@ -45,7 +58,28 @@ impl CompensatingAction for RemoveSwapSetup {
             self.operation_id
         );
 
+        #[cfg(test)]
+        {
+            if crate::test_helpers::mint::should_fail_for("REMOVE_SWAP_SETUP") {
+                return Err(Error::Database(cdk_common::database::Error::Database(
+                    "Test failure: REMOVE_SWAP_SETUP".into(),
+                )));
+            }
+        }
+
         let mut tx = db.begin_transaction().await?;
+
+        // Undo only a swap that's still set up. With its saga record gone, the swap finished,
+        // or something else undid it (recovery, a retry), and its inputs may belong to another
+        // swap by now. Locking the record also keeps two compensations from running at once.
+        if tx.get_saga_for_update(&self.operation_id).await?.is_none() {
+            tracing::info!(
+                "Compensation: swap {} already finished or undone, nothing to remove",
+                self.operation_id
+            );
+            tx.rollback().await?;
+            return Ok(());
+        }
 
         // Remove blinded messages (outputs)
         if !self.blinded_secrets.is_empty() {
@@ -75,4 +109,44 @@ impl CompensatingAction for RemoveSwapSetup {
     fn name(&self) -> &'static str {
         "RemoveSwapSetup"
     }
+}
+
+/// Retries compensations that failed, in the background, waiting longer each time.
+pub(crate) async fn retry_in_background(
+    mut compensations: VecDeque<Box<dyn CompensatingAction>>,
+    db: DynMintDatabase,
+    pubsub: Arc<PubSubManager>,
+) {
+    let mut delay = FIRST_RETRY_DELAY;
+
+    for attempt in 1..=RETRIES {
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_RETRY_DELAY);
+
+        let mut failed = VecDeque::new();
+        while let Some(compensation) = compensations.pop_front() {
+            if let Err(e) = compensation.execute(&db, &pubsub).await {
+                tracing::warn!(
+                    "Compensation {} failed again (retry {} of {}): {}",
+                    compensation.name(),
+                    attempt,
+                    RETRIES,
+                    e
+                );
+                failed.push_back(compensation);
+            }
+        }
+
+        if failed.is_empty() {
+            tracing::info!("Compensations succeeded on retry {}", attempt);
+            return;
+        }
+        compensations = failed;
+    }
+
+    tracing::error!(
+        "{} compensations still failing after {} retries; left to recovery at the next start",
+        compensations.len(),
+        RETRIES
+    );
 }

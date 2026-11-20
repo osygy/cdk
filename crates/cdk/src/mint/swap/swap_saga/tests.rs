@@ -3021,3 +3021,261 @@ async fn test_saga_deletion_failure_handling() {
     // This would require adding a TEST_FAIL_DELETE_SAGA env var check in the
     // database implementation's delete_saga method.
 }
+
+/// Sets up and signs a swap, then makes finalize() fail at the step `failure` names.
+///
+/// Returns the mint, the input Ys and the outputs' blinded secrets, for checks.
+async fn finalize_failing_at(
+    failure: &str,
+) -> (Mint, Vec<cdk_common::PublicKey>, Vec<cdk_common::PublicKey>) {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+
+    let db = mint.localstore();
+    let saga = SwapSaga::new(&mint, db.clone(), mint.pubsub_manager());
+    let saga = saga
+        .setup_swap(
+            &input_proofs,
+            &output_blinded_messages,
+            None,
+            input_verification,
+        )
+        .await
+        .expect("Setup should succeed");
+    let saga = saga.sign_outputs().await.expect("Signing should succeed");
+
+    set_fail_for(failure);
+    let result = saga.finalize().await;
+    clear_fail_for(failure);
+    assert!(result.is_err(), "Finalize should fail");
+
+    let ys = input_proofs.ys().unwrap();
+    let blinded_secrets = output_blinded_messages
+        .iter()
+        .map(|bm| bm.blinded_secret)
+        .collect();
+    (mint, ys, blinded_secrets)
+}
+
+/// Checks that a swap was undone: inputs removed, no signatures stored, no saga left.
+async fn assert_swap_undone(
+    mint: &Mint,
+    ys: &[cdk_common::PublicKey],
+    blinded_secrets: &[cdk_common::PublicKey],
+) {
+    use cdk_common::mint::OperationKind;
+
+    let db = mint.localstore();
+    let states = db.get_proofs_states(ys).await.unwrap();
+    assert!(
+        states.iter().all(|s| s.is_none()),
+        "Proofs should be removed by compensation"
+    );
+    let signatures = db.get_blind_signatures(blinded_secrets).await.unwrap();
+    assert!(
+        signatures.iter().all(|s| s.is_none()),
+        "Signatures should not be persisted"
+    );
+    let sagas = db.get_incomplete_sagas(OperationKind::Swap).await.unwrap();
+    assert!(sagas.is_empty(), "No saga should be left");
+}
+
+/// Tests that finalize() compensates when its transaction can't begin.
+///
+/// Under load, beginning TX2 can time out waiting for a database connection. The setup must
+/// still be undone, or the inputs stay pending until the next start.
+#[tokio::test]
+async fn test_swap_saga_compensation_on_finalize_begin_failure() {
+    let (mint, ys, blinded_secrets) = finalize_failing_at("BEGIN_FINALIZE").await;
+    assert_swap_undone(&mint, &ys, &blinded_secrets).await;
+}
+
+/// Tests that finalize() compensates when its transaction fails to commit.
+#[tokio::test]
+async fn test_swap_saga_compensation_on_finalize_commit_failure() {
+    let (mint, ys, blinded_secrets) = finalize_failing_at("COMMIT_FINALIZE").await;
+    assert_swap_undone(&mint, &ys, &blinded_secrets).await;
+}
+
+/// Tests that a compensation that fails is retried in the background.
+///
+/// A busy database can fail the compensation as well as the swap. The inputs must not stay
+/// pending until the next start.
+#[tokio::test]
+async fn test_swap_saga_failed_compensation_is_retried() {
+    set_fail_for("REMOVE_SWAP_SETUP");
+    let (mint, ys, blinded_secrets) = finalize_failing_at("ADD_SIGNATURES").await;
+
+    // The compensation failed, so the inputs are still pending, for now.
+    let states = mint.localstore().get_proofs_states(&ys).await.unwrap();
+    assert!(states.iter().all(|s| s == &Some(State::Pending)));
+
+    // The retry in the background undoes the swap.
+    clear_fail_for("REMOVE_SWAP_SETUP");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let states = mint.localstore().get_proofs_states(&ys).await.unwrap();
+        if states.iter().all(|s| s.is_none()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "The retry should undo the swap"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_swap_undone(&mint, &ys, &blinded_secrets).await;
+}
+
+/// Tests that compensating a swap that already finished changes nothing.
+///
+/// A compensation can run after its swap finished: after a commit that reported an error but
+/// went through, say. It must leave the spent inputs and the signatures alone.
+#[tokio::test]
+async fn test_swap_compensation_after_finish_changes_nothing() {
+    use super::compensation::{CompensatingAction, RemoveSwapSetup};
+
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, input_verification) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+
+    let db = mint.localstore();
+    let saga = SwapSaga::new(&mint, db.clone(), mint.pubsub_manager());
+    let operation_id = saga.operation_id;
+    let saga = saga
+        .setup_swap(
+            &input_proofs,
+            &output_blinded_messages,
+            None,
+            input_verification,
+        )
+        .await
+        .expect("Setup should succeed");
+    let saga = saga.sign_outputs().await.expect("Signing should succeed");
+    saga.finalize().await.expect("Finalize should succeed");
+
+    let ys = input_proofs.ys().unwrap();
+    let blinded_secrets: Vec<_> = output_blinded_messages
+        .iter()
+        .map(|bm| bm.blinded_secret)
+        .collect();
+    let compensation = RemoveSwapSetup {
+        blinded_secrets: blinded_secrets.clone(),
+        input_ys: ys.clone(),
+        operation_id,
+    };
+    compensation
+        .execute(&db, &mint.pubsub_manager())
+        .await
+        .expect("Compensating a finished swap should do nothing, without an error");
+
+    let states = db.get_proofs_states(&ys).await.unwrap();
+    assert!(states.iter().all(|s| s == &Some(State::Spent)));
+    let signatures = db.get_blind_signatures(&blinded_secrets).await.unwrap();
+    assert!(signatures.iter().all(Option::is_some));
+}
+
+/// Polls `fut` until `done` says the state it waits for has come, then drops it, as a client
+/// hanging up drops its request's future. `fut` must not finish first.
+async fn drop_once<F, D, R>(fut: F, mut done: D)
+where
+    F: std::future::Future,
+    D: FnMut() -> R,
+    R: std::future::Future<Output = bool>,
+{
+    use std::task::Poll;
+
+    let mut fut = Box::pin(fut);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let poll = std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await;
+        assert!(poll, "The swap should not be done yet");
+        if done().await {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "Timed out");
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// Waits until every proof in `ys` is in `state` (`None`: not in the database).
+async fn wait_for_states(mint: &Mint, ys: &[cdk_common::PublicKey], state: Option<State>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let states = mint.localstore().get_proofs_states(ys).await.unwrap();
+        if states.iter().all(|s| s == &state) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Proofs should reach {:?}, are {:?}",
+            state,
+            states
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Tests that a swap runs to the end if its caller goes away after the setup.
+///
+/// An HTTP client that hangs up drops the request's future. A swap dropped after its setup
+/// used to leave its inputs pending until the next start.
+#[tokio::test]
+async fn test_swap_finishes_when_caller_goes_away_after_setup() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, _) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+    let ys = input_proofs.ys().unwrap();
+    let swap_request = cdk_common::nuts::SwapRequest::new(input_proofs, output_blinded_messages);
+
+    // Hold the swap just after its setup, and drop its caller there.
+    set_fail_for("PAUSE_AFTER_SWAP_SETUP");
+    drop_once(mint.process_swap_request(swap_request), || async {
+        let states = mint.localstore().get_proofs_states(&ys).await.unwrap();
+        states.iter().all(|s| s == &Some(State::Pending))
+    })
+    .await;
+    clear_fail_for("PAUSE_AFTER_SWAP_SETUP");
+
+    wait_for_states(&mint, &ys, Some(State::Spent)).await;
+}
+
+/// Tests that a swap whose caller is gone before its setup changes nothing.
+///
+/// Under overload, clients give up while their swaps wait for the signatory. Those swaps
+/// are skipped, rather than run for nobody.
+#[tokio::test]
+async fn test_swap_skipped_when_caller_gone_before_setup() {
+    let mint = create_test_mint().await.unwrap();
+    let amount = Amount::from(100);
+    let (input_proofs, _) = create_swap_inputs(&mint, amount).await;
+    let (output_blinded_messages, _) = create_test_blinded_messages(&mint, amount).await.unwrap();
+    let ys = input_proofs.ys().unwrap();
+    let blinded_secrets: Vec<_> = output_blinded_messages
+        .iter()
+        .map(|bm| bm.blinded_secret)
+        .collect();
+    let swap_request = cdk_common::nuts::SwapRequest::new(input_proofs, output_blinded_messages);
+
+    let result = mint.run_swap(swap_request, || true).await;
+    assert!(result.is_err(), "The swap should be skipped");
+
+    let states = mint.localstore().get_proofs_states(&ys).await.unwrap();
+    assert!(
+        states.iter().all(Option::is_none),
+        "Inputs should be untouched"
+    );
+    let signatures = mint
+        .localstore()
+        .get_blind_signatures(&blinded_secrets)
+        .await
+        .unwrap();
+    assert!(
+        signatures.iter().all(Option::is_none),
+        "Nothing should be signed"
+    );
+}
