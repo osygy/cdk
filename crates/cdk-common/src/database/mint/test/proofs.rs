@@ -121,6 +121,76 @@ where
     assert_eq!(proofs_from_db.unwrap().len(), 2);
 }
 
+/// Test adding more proofs than fit in one multi-row statement
+pub async fn add_many_proofs<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error>,
+{
+    let keyset_id = setup_keyset(&db).await;
+    let quote_id = QuoteId::new();
+
+    // 130 proofs: two full statements of 64 and one of 2.
+    let proofs = (0..130u64)
+        .map(|i| Proof {
+            amount: Amount::from(i + 1),
+            keyset_id,
+            secret: Secret::generate(),
+            c: SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        })
+        .collect::<Vec<_>>();
+    let ys = proofs.iter().map(|p| p.y().unwrap()).collect::<Vec<_>>();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_proofs(
+        proofs.clone(),
+        Some(quote_id.clone()),
+        &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let stored = db.get_proofs_by_ys(&ys).await.unwrap();
+    assert_eq!(stored.len(), 130);
+    for (proof, stored) in proofs.iter().zip(stored) {
+        let stored = stored.expect("every proof is stored");
+        assert_eq!(stored.amount, proof.amount);
+        assert_eq!(stored.secret, proof.secret);
+        assert_eq!(stored.c, proof.c);
+    }
+    assert_eq!(
+        db.get_proof_ys_by_quote_id(&quote_id).await.unwrap().len(),
+        130
+    );
+
+    // One of them again, among new ones in a later statement, is still a duplicate.
+    let mut again = (0..70u64)
+        .map(|_| Proof {
+            amount: Amount::from(1u64),
+            keyset_id,
+            secret: Secret::generate(),
+            c: SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        })
+        .collect::<Vec<_>>();
+    again.push(proofs[129].clone());
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let result = tx
+        .add_proofs(
+            again,
+            None,
+            &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+        )
+        .await;
+    assert!(result.is_err());
+    tx.rollback().await.unwrap();
+}
+
 /// Test to add duplicate proofs
 pub async fn add_duplicate_proofs<DB>(db: DB)
 where

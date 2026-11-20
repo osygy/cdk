@@ -70,6 +70,18 @@ pub(crate) struct KeysetAmountsDelta {
     pub(crate) fee_collected: i64,
 }
 
+/// Rows per multi-row `INSERT`. 64 rows of up to 11 columns stays under 999 parameters, the
+/// lowest limit SQLite has had, and keeps the SQL texts a writer makes (one per row count) to 64.
+/// A swap or melt of up to 64 inputs or outputs takes one statement.
+pub(crate) const ROWS_PER_STATEMENT: usize = 64;
+
+/// The rows of a multi-row `VALUES`: `row(0), row(1), ...`. Each row names its own
+/// placeholders by its index (`:y0`, `:y1`, ...), so the rows bind one by one; a placeholder
+/// without an index is shared by every row.
+pub(crate) fn values_rows(rows: usize, row: impl Fn(usize) -> String) -> String {
+    (0..rows).map(row).collect::<Vec<_>>().join(", ")
+}
+
 /// Sorted, deduplicated advisory lock keys for a batch of quotes.
 fn quote_lock_keys(quote_ids: &[QuoteId]) -> Vec<String> {
     let mut keys = quote_ids

@@ -1,6 +1,6 @@
 //! Signatures database implementation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use cdk_common::util::unix_time;
 use cdk_common::{Amount, BlindSignature, BlindSignatureDleq, Id, PublicKey, SecretKey};
 
 use super::proofs::sql_row_to_hashmap_amount;
-use super::{SQLMintDatabase, SQLTransaction};
+use super::{values_rows, SQLMintDatabase, SQLTransaction, ROWS_PER_STATEMENT};
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
 use crate::{column_as_nullable_string, column_as_number, column_as_string, unpack_into};
@@ -101,105 +101,82 @@ where
             left.to_bytes().cmp(&right.to_bytes())
         });
 
-        // Mutate rows in blinded-message order while retaining the request order index.
-        for (i, (message, signature)) in ordered_signatures {
-            match existing_rows.remove(message) {
-                None => {
-                    // Unknown blind message: Insert new row with all columns
-                    query(
-                        r#"
-                        INSERT INTO blind_signature
-                        (blinded_message, amount, keyset_id, c, quote_id, dleq_e, dleq_s, created_time, signed_time, order_index)
-                        VALUES
-                        (:blinded_message, :amount, :keyset_id, :c, :quote_id, :dleq_e, :dleq_s, :created_time, :signed_time, :order_index)
-                        "#,
-                    )?
-                    .bind("blinded_message", message.to_bytes().to_vec())
-                    .bind("amount", u64::from(signature.amount) as i64)
-                    .bind("keyset_id", signature.keyset_id.to_string())
-                    .bind("c", signature.c.to_bytes().to_vec())
-                    .bind("quote_id", quote_id.as_ref().map(|q| q.to_string()))
+        // Check every row before writing any: a message signed already is a duplicate, and so
+        // is one that comes twice in the request. The rest are written together below.
+        let mut seen = HashSet::new();
+        for (_, (message, _)) in &ordered_signatures {
+            if !seen.insert(*message) {
+                return Err(database::Error::Duplicate);
+            }
+            match existing_rows.remove(*message) {
+                // Unknown blind message: inserted with all columns.
+                None => {}
+                // Blind message with no c: its c, dleq_e and dleq_s filled in.
+                Some((Column::Null, _, _)) => {}
+                Some(_) => {
+                    // Blind message already has c: Error
+                    tracing::error!(
+                        "Attempting to add signature to message already signed {}",
+                        message
+                    );
+
+                    return Err(database::Error::Duplicate);
+                }
+            }
+        }
+
+        // Many rows to a statement, still in blinded-message order, keeping the request's order
+        // index. One upsert does both: a new message is inserted with every column, and a pending
+        // one (in the table, its c NULL) gets the columns the UPDATE used to set.
+        let quote_id = quote_id.map(|q| q.to_string());
+        for chunk in ordered_signatures.chunks(ROWS_PER_STATEMENT) {
+            let sql = format!(
+                r#"
+                INSERT INTO blind_signature
+                (blinded_message, amount, keyset_id, c, quote_id, dleq_e, dleq_s, created_time, signed_time, order_index)
+                VALUES {}
+                ON CONFLICT (blinded_message) DO UPDATE
+                SET c = excluded.c, dleq_e = excluded.dleq_e, dleq_s = excluded.dleq_s,
+                    signed_time = excluded.signed_time, amount = excluded.amount
+                "#,
+                values_rows(chunk.len(), |i| {
+                    format!(
+                    "(:blinded_message{i}, :amount{i}, :keyset_id{i}, :c{i}, :quote_id, :dleq_e{i}, \
+                     :dleq_s{i}, :created_time, :signed_time, :order_index{i})"
+                )
+                })
+            );
+            let mut stmt = query(&sql)?
+                .bind("quote_id", quote_id.clone())
+                .bind("created_time", current_time as i64)
+                .bind("signed_time", current_time as i64);
+            for (row, (i, (message, signature))) in chunk.iter().enumerate() {
+                stmt = stmt
+                    .bind(format!("blinded_message{row}"), message.to_bytes().to_vec())
+                    .bind(format!("amount{row}"), u64::from(signature.amount) as i64)
+                    .bind(format!("keyset_id{row}"), signature.keyset_id.to_string())
+                    .bind(format!("c{row}"), signature.c.to_bytes().to_vec())
                     .bind(
-                        "dleq_e",
+                        format!("dleq_e{row}"),
                         signature.dleq.as_ref().map(|dleq| dleq.e.to_secret_hex()),
                     )
                     .bind(
-                        "dleq_s",
+                        format!("dleq_s{row}"),
                         signature.dleq.as_ref().map(|dleq| dleq.s.to_secret_hex()),
                     )
-                    .bind("created_time", current_time as i64)
-                    .bind("signed_time", current_time as i64)
-                    .bind("order_index", i as i64)
-                    .execute(&self.inner)
-                    .await?;
-
-                    // Written at commit (see SQLTransaction::keyset_deltas).
-
-                    self.add_keyset_delta(
-
-                        signature.keyset_id.to_string(),
-
-                        u64::from(signature.amount) as i64,
-
-                        0,
-
-                        0,
-
-                    );
-                }
-                Some((c, _dleq_e, _dleq_s)) => {
-                    // Blind message exists: check if c is NULL
-                    match c {
-                        Column::Null => {
-                            // Blind message with no c: Update with missing columns c, dleq_e, dleq_s
-                            query(
-                                r#"
-                                UPDATE blind_signature
-                                SET c = :c, dleq_e = :dleq_e, dleq_s = :dleq_s, signed_time = :signed_time, amount = :amount
-                                WHERE blinded_message = :blinded_message
-                                "#,
-                            )?
-                            .bind("c", signature.c.to_bytes().to_vec())
-                            .bind(
-                                "dleq_e",
-                                signature.dleq.as_ref().map(|dleq| dleq.e.to_secret_hex()),
-                            )
-                            .bind(
-                                "dleq_s",
-                                signature.dleq.as_ref().map(|dleq| dleq.s.to_secret_hex()),
-                            )
-                            .bind("blinded_message", message.to_bytes().to_vec())
-                            .bind("signed_time", current_time as i64)
-                            .bind("amount", u64::from(signature.amount) as i64)
-                            .execute(&self.inner)
-                            .await?;
-
-                            // Written at commit (see SQLTransaction::keyset_deltas).
-
-                            self.add_keyset_delta(
-
-                                signature.keyset_id.to_string(),
-
-                                u64::from(signature.amount) as i64,
-
-                                0,
-
-                                0,
-
-                            );
-                        }
-                        _ => {
-                            // Blind message already has c: Error
-                            tracing::error!(
-                                "Attempting to add signature to message already signed {}",
-                                message
-                            );
-
-                            return Err(database::Error::Duplicate);
-                        }
-                    }
-                }
+                    .bind(format!("order_index{row}"), *i as i64);
             }
+            stmt.execute(&self.inner).await?;
+        }
+
+        // Written at commit (see SQLTransaction::keyset_deltas).
+        for (_, (_, signature)) in &ordered_signatures {
+            self.add_keyset_delta(
+                signature.keyset_id.to_string(),
+                u64::from(signature.amount) as i64,
+                0,
+                0,
+            );
         }
 
         debug_assert!(

@@ -349,6 +349,7 @@ macro_rules! mint_db_test {
         mint_db_test!(
             $make_db_fn,
             add_and_find_proofs,
+            add_many_proofs,
             add_duplicate_proofs,
             kvstore_functionality,
             kvstore_write_if_absent,
@@ -383,6 +384,8 @@ macro_rules! mint_db_test {
             get_total_issued,
             get_nonexistent_blind_signatures,
             add_duplicate_blind_signatures,
+            add_many_blind_signatures,
+            add_blind_signatures_repeated_message,
             add_and_get_keyset_info,
             add_duplicate_keyset_info,
             get_all_keyset_infos,

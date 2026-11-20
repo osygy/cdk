@@ -24,7 +24,7 @@ use cdk_prometheus::MintMetricGuard;
 use lightning_invoice::Bolt11Invoice;
 use tracing::instrument;
 
-use super::{SQLMintDatabase, SQLTransaction};
+use super::{values_rows, SQLMintDatabase, SQLTransaction, ROWS_PER_STATEMENT};
 use crate::database::DatabaseExecutor;
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
@@ -709,41 +709,41 @@ where
                 .cmp(&right.blinded_secret.to_bytes())
         });
 
-        // Insert blinded_messages directly into blind_signature with c = NULL
-        // Let the database constraint handle duplicate detection
-        for (i, message) in ordered_messages {
-            match query(
+        // Insert blinded_messages directly into blind_signature with c = NULL, many rows to a
+        // statement, still in blinded-message order. Let the database constraint handle
+        // duplicate detection: a message already there, signed or pending, fails the statement
+        // with a primary key violation, which comes back as `database::Error::Duplicate`.
+        let quote_id = quote_id.map(|q| q.to_string());
+        for chunk in ordered_messages.chunks(ROWS_PER_STATEMENT) {
+            let sql = format!(
                 r#"
                 INSERT INTO blind_signature
                 (blinded_message, amount, keyset_id, c, quote_id, created_time, operation_kind, operation_id, order_index)
-                VALUES
-                (:blinded_message, :amount, :keyset_id, NULL, :quote_id, :created_time, :operation_kind, :operation_id, :order_index)
+                VALUES {}
                 "#,
-            )?
-            .bind(
-                "blinded_message",
-                message.blinded_secret.to_bytes().to_vec(),
-            )
-            .bind("amount", message.amount.to_i64())
-            .bind("keyset_id", message.keyset_id.to_string())
-            .bind("quote_id", quote_id.map(|q| q.to_string()))
-            .bind("created_time", current_time as i64)
-            .bind("operation_kind", operation.kind().to_string())
-            .bind("operation_id", operation.id().to_string())
-            .bind("order_index", i as i64)
-            .execute(&self.inner)
-            .await
-            {
-                Ok(_) => continue,
-                Err(database::Error::Duplicate) => {
-                    // Primary key constraint violation - blinded message already exists
-                    // This could be either:
-                    // 1. Already signed (c IS NOT NULL) - definitely an error
-                    // 2. Already pending (c IS NULL) - also an error
-                    return Err(database::Error::Duplicate);
-                }
-                Err(err) => return Err(err),
+                values_rows(chunk.len(), |i| {
+                    format!(
+                    "(:blinded_message{i}, :amount{i}, :keyset_id{i}, NULL, :quote_id, :created_time, \
+                     :operation_kind, :operation_id, :order_index{i})"
+                )
+                })
+            );
+            let mut stmt = query(&sql)?
+                .bind("quote_id", quote_id.clone())
+                .bind("created_time", current_time as i64)
+                .bind("operation_kind", operation.kind().to_string())
+                .bind("operation_id", operation.id().to_string());
+            for (row, (i, message)) in chunk.iter().enumerate() {
+                stmt = stmt
+                    .bind(
+                        format!("blinded_message{row}"),
+                        message.blinded_secret.to_bytes().to_vec(),
+                    )
+                    .bind(format!("amount{row}"), message.amount.to_i64())
+                    .bind(format!("keyset_id{row}"), message.keyset_id.to_string())
+                    .bind(format!("order_index{row}"), *i as i64);
             }
+            stmt.execute(&self.inner).await?;
         }
 
         Ok(())

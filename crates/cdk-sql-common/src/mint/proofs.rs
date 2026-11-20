@@ -13,7 +13,7 @@ use cdk_common::secret::Secret;
 use cdk_common::util::unix_time;
 use cdk_common::{Amount, Id, Proof, Proofs, PublicKey, State};
 
-use super::{SQLMintDatabase, SQLTransaction};
+use super::{values_rows, SQLMintDatabase, SQLTransaction, ROWS_PER_STATEMENT};
 use crate::database::DatabaseExecutor;
 use crate::pool::DatabasePool;
 use crate::stmt::{query, Column};
@@ -157,31 +157,48 @@ where
             None => Ok(()), // no previous record
         }?;
 
-        for (y, proof) in ordered_proofs {
-            query(
+        // Many rows to a statement, still in y order: one round trip, and one statement's own
+        // work, for up to ROWS_PER_STATEMENT proofs instead of for each one.
+        let quote_id = quote_id.map(|q| q.to_string());
+        for chunk in ordered_proofs.chunks(ROWS_PER_STATEMENT) {
+            let sql = format!(
                 r#"
                   INSERT INTO proof
                   (y, amount, keyset_id, secret, c, witness, state, quote_id, created_time, operation_kind, operation_id)
-                  VALUES
-                  (:y, :amount, :keyset_id, :secret, :c, :witness, :state, :quote_id, :created_time, :operation_kind, :operation_id)
+                  VALUES {}
                   "#,
-            )?
-            .bind("y", y)
-            .bind("amount", proof.amount.to_i64())
-            .bind("keyset_id", proof.keyset_id.to_string())
-            .bind("secret", proof.secret.to_string())
-            .bind("c", proof.c.to_bytes().to_vec())
-            .bind(
-                "witness",
-                proof.witness.clone().and_then(|w| serde_json::to_string(&w).inspect_err(|e| tracing::error!("Failed to serialize witness: {:?}", e)).ok()),
-            )
-            .bind("state", "UNSPENT".to_string())
-            .bind("quote_id", quote_id.clone().map(|q| q.to_string()))
-            .bind("created_time", current_time as i64)
-            .bind("operation_kind", operation.kind().to_string())
-            .bind("operation_id", operation.id().to_string())
-            .execute(&self.inner)
-            .await?;
+                values_rows(chunk.len(), |i| {
+                    format!(
+                    "(:y{i}, :amount{i}, :keyset_id{i}, :secret{i}, :c{i}, :witness{i}, :state, :quote_id, \
+                     :created_time, :operation_kind, :operation_id)"
+                )
+                })
+            );
+            let mut stmt = query(&sql)?
+                .bind("state", "UNSPENT".to_string())
+                .bind("quote_id", quote_id.clone())
+                .bind("created_time", current_time as i64)
+                .bind("operation_kind", operation.kind().to_string())
+                .bind("operation_id", operation.id().to_string());
+            for (i, (y, proof)) in chunk.iter().enumerate() {
+                stmt = stmt
+                    .bind(format!("y{i}"), y.clone())
+                    .bind(format!("amount{i}"), proof.amount.to_i64())
+                    .bind(format!("keyset_id{i}"), proof.keyset_id.to_string())
+                    .bind(format!("secret{i}"), proof.secret.to_string())
+                    .bind(format!("c{i}"), proof.c.to_bytes().to_vec())
+                    .bind(
+                        format!("witness{i}"),
+                        proof.witness.clone().and_then(|w| {
+                            serde_json::to_string(&w)
+                                .inspect_err(|e| {
+                                    tracing::error!("Failed to serialize witness: {:?}", e)
+                                })
+                                .ok()
+                        }),
+                    );
+            }
+            stmt.execute(&self.inner).await?;
         }
 
         Ok(ProofsWithState::new(proofs, State::Unspent).into())

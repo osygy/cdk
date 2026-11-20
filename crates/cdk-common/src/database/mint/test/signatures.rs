@@ -7,6 +7,7 @@ use cashu::{Amount, BlindSignature, Id, SecretKey};
 
 use crate::database::mint::{Database, Error, KeysDatabase, QuoteId};
 use crate::database::MintSignaturesDatabase;
+use crate::mint::Operation;
 
 /// Test adding and retrieving blind signatures
 pub async fn add_and_get_blind_signatures<DB>(db: DB)
@@ -282,4 +283,105 @@ where
         .await;
     assert!(result.is_err());
     tx.rollback().await.unwrap();
+}
+
+/// Test signing more messages than fit in one multi-row statement: most of them pending (added
+/// as blinded messages first, as a swap does), a few unknown, in one call.
+pub async fn add_many_blind_signatures<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+
+    // 130 pending and 3 unknown: three statements of blinded messages, three of signatures.
+    let pending = (0..130u64)
+        .map(|i| cashu::BlindedMessage {
+            blinded_secret: SecretKey::generate().public_key(),
+            keyset_id,
+            amount: Amount::from(i + 1),
+            witness: None,
+        })
+        .collect::<Vec<_>>();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blinded_messages(
+        None,
+        &pending,
+        &Operation::new_swap(Amount::ZERO, Amount::ZERO, Amount::ZERO),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut messages = pending.iter().map(|m| m.blinded_secret).collect::<Vec<_>>();
+    messages.extend((0..3).map(|_| SecretKey::generate().public_key()));
+    let signatures = messages
+        .iter()
+        .enumerate()
+        .map(|(i, _)| BlindSignature {
+            amount: Amount::from(i as u64 + 1),
+            keyset_id,
+            c: SecretKey::generate().public_key(),
+            dleq: None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    tx.add_blind_signatures(&messages, &signatures, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let stored = db.get_blind_signatures(&messages).await.unwrap();
+    assert_eq!(stored.len(), 133);
+    for (signature, stored) in signatures.iter().zip(stored) {
+        let stored = stored.expect("every signature is stored");
+        assert_eq!(stored.c, signature.c);
+        assert_eq!(stored.amount, signature.amount);
+    }
+
+    // Signing one of them again fails, even among unknown ones.
+    let mut again = (0..70)
+        .map(|_| SecretKey::generate().public_key())
+        .collect::<Vec<_>>();
+    again.push(messages[5]);
+    let again_signatures = again
+        .iter()
+        .map(|_| signatures[0].clone())
+        .collect::<Vec<_>>();
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let result = tx
+        .add_blind_signatures(&again, &again_signatures, None)
+        .await;
+    assert!(matches!(result, Err(Error::Duplicate)));
+    tx.rollback().await.unwrap();
+}
+
+/// Test that a message given twice in one call is a duplicate, and nothing is written
+pub async fn add_blind_signatures_repeated_message<DB>(db: DB)
+where
+    DB: Database<Error> + KeysDatabase<Err = Error> + MintSignaturesDatabase<Err = Error>,
+{
+    let keyset_id = Id::from_str("001711afb1de20cb").unwrap();
+    let message = SecretKey::generate().public_key();
+    let other = SecretKey::generate().public_key();
+    let sig = BlindSignature {
+        amount: Amount::from(100u64),
+        keyset_id,
+        c: SecretKey::generate().public_key(),
+        dleq: None,
+    };
+
+    let mut tx = Database::begin_transaction(&db).await.unwrap();
+    let result = tx
+        .add_blind_signatures(
+            &[message, other, message],
+            &[sig.clone(), sig.clone(), sig.clone()],
+            None,
+        )
+        .await;
+    assert!(matches!(result, Err(Error::Duplicate)));
+    tx.rollback().await.unwrap();
+
+    let stored = db.get_blind_signatures(&[message, other]).await.unwrap();
+    assert!(stored.iter().all(Option::is_none));
 }
