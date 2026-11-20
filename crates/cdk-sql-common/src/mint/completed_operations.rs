@@ -98,18 +98,8 @@ where
 
         for (keyset_id, fee) in fees {
             if fee.to_u64() > 0 {
-                query(
-                    r#"
-                    INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, fee_collected)
-                    VALUES (:keyset_id, 0, 0, :fee)
-                    ON CONFLICT (keyset_id)
-                    DO UPDATE SET fee_collected = keyset_amounts.fee_collected + EXCLUDED.fee_collected
-                    "#,
-                )?
-                .bind("keyset_id", keyset_id.to_string())
-                .bind("fee", fee.to_u64() as i64)
-                .execute(&self.inner)
-                .await?;
+                // Written at commit (see SQLTransaction::keyset_deltas).
+                self.add_keyset_delta(keyset_id.to_string(), 0, 0, fee.to_u64() as i64);
             }
         }
 

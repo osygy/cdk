@@ -320,6 +320,7 @@ where
         &'a self,
     ) -> Result<Box<dyn MintKeyDatabaseTransaction<'a, Error> + Send + Sync + 'a>, Error> {
         let tx = SQLTransaction {
+            keyset_deltas: Default::default(),
             inner: ConnectionWithTransaction::new(
                 self.pool
                     .get()

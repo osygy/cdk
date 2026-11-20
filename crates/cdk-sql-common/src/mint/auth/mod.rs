@@ -253,6 +253,7 @@ where
     ) -> Result<Box<dyn MintAuthTransaction<database::Error> + Send + Sync + 'a>, database::Error>
     {
         Ok(Box::new(SQLTransaction {
+            keyset_deltas: Default::default(),
             inner: ConnectionWithTransaction::new(
                 self.pool
                     .get()

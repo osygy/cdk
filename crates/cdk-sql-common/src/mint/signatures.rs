@@ -133,18 +133,19 @@ where
                     .execute(&self.inner)
                     .await?;
 
-                    query(
-                        r#"
-                        INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                        VALUES (:keyset_id, :amount, 0)
-                        ON CONFLICT (keyset_id)
-                        DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
-                        "#,
-                    )?
-                    .bind("amount", u64::from(signature.amount) as i64)
-                    .bind("keyset_id", signature.keyset_id.to_string())
-                    .execute(&self.inner)
-                    .await?;
+                    // Written at commit (see SQLTransaction::keyset_deltas).
+
+                    self.add_keyset_delta(
+
+                        signature.keyset_id.to_string(),
+
+                        u64::from(signature.amount) as i64,
+
+                        0,
+
+                        0,
+
+                    );
                 }
                 Some((c, _dleq_e, _dleq_s)) => {
                     // Blind message exists: check if c is NULL
@@ -173,18 +174,19 @@ where
                             .execute(&self.inner)
                             .await?;
 
-                            query(
-                                r#"
-                                INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                                VALUES (:keyset_id, :amount, 0)
-                                ON CONFLICT (keyset_id)
-                                DO UPDATE SET total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued
-                                "#,
-                            )?
-                            .bind("amount", u64::from(signature.amount) as i64)
-                            .bind("keyset_id", signature.keyset_id.to_string())
-                            .execute(&self.inner)
-                            .await?;
+                            // Written at commit (see SQLTransaction::keyset_deltas).
+
+                            self.add_keyset_delta(
+
+                                signature.keyset_id.to_string(),
+
+                                u64::from(signature.amount) as i64,
+
+                                0,
+
+                                0,
+
+                            );
                         }
                         _ => {
                             // Blind message already has c: Error

@@ -8,6 +8,7 @@
 //! The trait expects an asynchronous interaction, but it also provides tools to spawn blocking
 //! clients in a pool and expose them to an asynchronous environment, making them compatible with
 //! Mint.
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -55,6 +56,18 @@ where
     RM: DatabasePool + 'static,
 {
     pub(crate) inner: ConnectionWithTransaction<RM::Connection, PooledResource<RM>>,
+    /// Changes to `keyset_amounts` made in this transaction, by keyset ID. They're written once
+    /// per keyset, just before commit, so the keyset's totals row stays locked only for that
+    /// statement and the commit, not for the rest of the transaction. Dropped on rollback.
+    pub(crate) keyset_deltas: BTreeMap<String, KeysetAmountsDelta>,
+}
+
+/// What a transaction adds to one keyset's row in `keyset_amounts`.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct KeysetAmountsDelta {
+    pub(crate) issued: i64,
+    pub(crate) redeemed: i64,
+    pub(crate) fee_collected: i64,
 }
 
 /// Sorted, deduplicated advisory lock keys for a batch of quotes.
@@ -92,6 +105,7 @@ where
                 pool.get().await.map_err(|e| Error::Database(Box::new(e)))?,
             )
             .await?,
+            keyset_deltas: BTreeMap::new(),
         };
 
         Ok(Box::new(tx))
@@ -130,6 +144,48 @@ where
 
         Ok(true)
     }
+
+    /// Records a change to a keyset's totals, to be written at commit.
+    pub(crate) fn add_keyset_delta(
+        &mut self,
+        keyset_id: String,
+        issued: i64,
+        redeemed: i64,
+        fee_collected: i64,
+    ) {
+        let delta = self.keyset_deltas.entry(keyset_id).or_default();
+        delta.issued += issued;
+        delta.redeemed += redeemed;
+        delta.fee_collected += fee_collected;
+    }
+
+    /// Writes the recorded totals, one upsert per keyset. The map is ordered by keyset ID, so
+    /// concurrent transactions lock shared rows in the same order and can't deadlock.
+    async fn flush_keyset_deltas(&mut self) -> Result<(), Error> {
+        for (keyset_id, delta) in std::mem::take(&mut self.keyset_deltas) {
+            if delta.issued == 0 && delta.redeemed == 0 && delta.fee_collected == 0 {
+                continue;
+            }
+            query(
+                r#"
+                INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed, fee_collected)
+                VALUES (:keyset_id, :issued, :redeemed, :fee_collected)
+                ON CONFLICT (keyset_id)
+                DO UPDATE SET
+                    total_issued = keyset_amounts.total_issued + EXCLUDED.total_issued,
+                    total_redeemed = keyset_amounts.total_redeemed + EXCLUDED.total_redeemed,
+                    fee_collected = keyset_amounts.fee_collected + EXCLUDED.fee_collected
+                "#,
+            )?
+            .bind("keyset_id", keyset_id)
+            .bind("issued", delta.issued)
+            .bind("redeemed", delta.redeemed)
+            .bind("fee_collected", delta.fee_collected)
+            .execute(&self.inner)
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -149,11 +205,15 @@ where
 {
     type Err = Error;
 
-    async fn commit(self: Box<Self>) -> Result<(), Error> {
+    async fn commit(mut self: Box<Self>) -> Result<(), Error> {
         #[cfg(feature = "prometheus")]
         let metrics = MintMetricGuard::new("transaction_commit");
 
-        let result = self.inner.commit().await;
+        // On an error, dropping the transaction rolls it back.
+        let result = match self.flush_keyset_deltas().await {
+            Ok(()) => self.inner.commit().await,
+            Err(err) => Err(err),
+        };
 
         #[cfg(feature = "prometheus")]
         {
@@ -335,7 +395,10 @@ mod tests {
             .await
             .expect("test transaction should begin");
 
-        SQLTransaction { inner }
+        SQLTransaction {
+            inner,
+            keyset_deltas: Default::default(),
+        }
     }
 
     fn labels_match(

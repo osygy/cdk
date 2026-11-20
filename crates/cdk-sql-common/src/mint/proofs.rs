@@ -213,21 +213,15 @@ where
             .await?;
 
         if new_state == State::Spent {
-            query(
-                    r#"
-                    INSERT INTO keyset_amounts (keyset_id, total_issued, total_redeemed)
-                    SELECT keyset_id, 0, COALESCE(SUM(amount), 0)
-                    FROM proof
-                    WHERE y IN (:ys)
-                    GROUP BY keyset_id
-                    ORDER BY keyset_id
-                    ON CONFLICT (keyset_id)
-                    DO UPDATE SET total_redeemed = keyset_amounts.total_redeemed + EXCLUDED.total_redeemed
-                    "#,
-                )?
-                .bind_vec("ys", ys.iter().map(|y| y.to_bytes().to_vec()).collect())?
-                .execute(&self.inner)
-                .await?;
+            // Written at commit (see SQLTransaction::keyset_deltas).
+            for proof in proofs.iter() {
+                self.add_keyset_delta(
+                    proof.keyset_id.to_string(),
+                    0,
+                    u64::from(proof.amount) as i64,
+                    0,
+                );
+            }
         }
 
         proofs.state = new_state;

@@ -165,6 +165,7 @@ where
     ) -> Result<Box<dyn cdk_common::database::KVStoreTransaction<Self::Err> + Send + Sync>, Error>
     {
         Ok(Box::new(SQLTransaction {
+            keyset_deltas: Default::default(),
             inner: ConnectionWithTransaction::new(
                 self.pool
                     .get()
