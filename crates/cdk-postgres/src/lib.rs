@@ -13,11 +13,14 @@ use cdk_sql_common::mint::SQLMintAuthDatabase;
 use cdk_sql_common::pool::{DatabaseConfig, DatabasePool};
 use cdk_sql_common::stmt::{Column, Statement};
 use cdk_sql_common::{SQLMintDatabase, SQLWalletDatabase};
-use db::{pg_batch, pg_execute, pg_execute_then_commit, pg_fetch_all, pg_fetch_one, pg_pluck};
+use db::{
+    pg_batch, pg_execute, pg_execute_then_commit, pg_fetch_all, pg_fetch_one, pg_pluck, Statements,
+};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::timeout;
 use tokio_postgres::{Client, Error as PgError, NoTls};
 
+mod cache;
 mod db;
 mod tls;
 mod value;
@@ -182,6 +185,10 @@ pub struct PostgresConnection {
     error: Arc<Mutex<Option<cdk_common::database::Error>>>,
     result: Arc<OnceLock<Client>>,
     notify: Arc<Notify>,
+    /// The statements prepared on this connection, so each SQL text is prepared once and then
+    /// only executed: one round trip per statement instead of two. They live and die with the
+    /// connection, as prepared statements do on the server.
+    statements: Statements,
 }
 
 impl PostgresConnection {
@@ -285,6 +292,7 @@ impl PostgresConnection {
             timeout,
             result,
             notify,
+            statements: Statements::new(cache::CAPACITY),
         }
     }
 
@@ -340,7 +348,7 @@ impl DatabaseTransaction<PostgresConnection> for PostgresTransactionHandler {
         if statements.is_empty() {
             return Self::commit(conn).await;
         }
-        pg_execute_then_commit(conn.inner().await?, statements).await
+        pg_execute_then_commit(conn.inner().await?, &conn.statements, statements).await
     }
 
     async fn begin(conn: &mut PostgresConnection) -> Result<(), Error> {
@@ -359,19 +367,19 @@ impl DatabaseExecutor for PostgresConnection {
     }
 
     async fn execute(&self, statement: Statement) -> Result<usize, Error> {
-        pg_execute(self.inner().await?, statement).await
+        pg_execute(self.inner().await?, &self.statements, statement).await
     }
 
     async fn fetch_one(&self, statement: Statement) -> Result<Option<Vec<Column>>, Error> {
-        pg_fetch_one(self.inner().await?, statement).await
+        pg_fetch_one(self.inner().await?, &self.statements, statement).await
     }
 
     async fn fetch_all(&self, statement: Statement) -> Result<Vec<Vec<Column>>, Error> {
-        pg_fetch_all(self.inner().await?, statement).await
+        pg_fetch_all(self.inner().await?, &self.statements, statement).await
     }
 
     async fn pluck(&self, statement: Statement) -> Result<Option<Column>, Error> {
-        pg_pluck(self.inner().await?, statement).await
+        pg_pluck(self.inner().await?, &self.statements, statement).await
     }
 
     async fn batch(&self, statement: Statement) -> Result<(), Error> {
@@ -506,6 +514,94 @@ mod test {
             .await
             .expect("select");
         assert_eq!(rows.len(), 3, "only 1, 2 and 3 are committed: {rows:?}");
+    }
+
+    /// A pool of one connection, in a schema of its own.
+    fn single_connection_pool(
+        name: &str,
+    ) -> std::sync::Arc<cdk_sql_common::pool::Pool<PgConnectionPool>> {
+        let test_id = format!("test_{name}_{}", uuid::Uuid::new_v4().simple());
+        let db_url = std::env::var("CDK_MINTD_DATABASE_URL")
+            .or_else(|_| std::env::var("PG_DB_URL"))
+            .unwrap_or(
+                "host=localhost user=cdk_user password=cdk_password dbname=cdk_mint port=5432"
+                    .to_owned(),
+            );
+        cdk_sql_common::pool::Pool::<PgConnectionPool>::new(PgConfig::new(
+            &format!("{db_url} schema={test_id}"),
+            None,
+            Some(1),
+            Some(10),
+        ))
+    }
+
+    /// A connection prepares each SQL text once, and runs it again from its cache. The server
+    /// holds exactly the statements the connection has cached.
+    #[tokio::test]
+    async fn statements_are_prepared_once_per_connection() {
+        use cdk_sql_common::stmt::query;
+        use cdk_sql_common::value::Value;
+
+        let pool = single_connection_pool("statement_cache");
+        let conn = pool.get().await.expect("connection");
+        let before = conn.statements.len();
+
+        for _ in 0..3 {
+            query("SELECT 1")
+                .expect("statement")
+                .fetch_one(&*conn)
+                .await
+                .expect("select 1");
+        }
+        query("SELECT 2")
+            .expect("statement")
+            .fetch_one(&*conn)
+            .await
+            .expect("select 2");
+        assert_eq!(conn.statements.len(), before + 2, "each prepared once");
+
+        let on_server = query("SELECT count(*) FROM pg_prepared_statements")
+            .expect("statement")
+            .pluck(&*conn)
+            .await
+            .expect("count")
+            .expect("a row");
+        let cached = conn.statements.len();
+        assert_eq!(cached, before + 3, "the count is cached too");
+        assert_eq!(on_server, Value::Integer(cached as i64), "{on_server:?}");
+    }
+
+    /// A cached statement whose result columns changed under it (another mint migrated the
+    /// database) fails once, and is forgotten: the next request prepares it again.
+    #[tokio::test]
+    async fn a_statement_whose_result_changed_is_prepared_again() {
+        use cdk_sql_common::stmt::query;
+
+        let pool = single_connection_pool("statement_cache_stale");
+        let conn = pool.get().await.expect("connection");
+        query("CREATE TABLE t (a BIGINT); INSERT INTO t (a) VALUES (1)")
+            .expect("statement")
+            .batch(&*conn)
+            .await
+            .expect("table");
+        let select = || query("SELECT * FROM t").expect("statement");
+
+        let rows = select().fetch_all(&*conn).await.expect("select");
+        assert_eq!(rows.first().map(Vec::len), Some(1), "{rows:?}");
+
+        query("ALTER TABLE t ADD COLUMN b BIGINT")
+            .expect("statement")
+            .batch(&*conn)
+            .await
+            .expect("alter");
+        let err = select()
+            .fetch_all(&*conn)
+            .await
+            .expect_err("the cached statement's result columns changed");
+        assert!(matches!(err, Error::Database(_)), "{err:?}");
+
+        let rows = select().fetch_all(&*conn).await.expect("prepared again");
+        assert_eq!(rows.first().map(Vec::len), Some(2), "{rows:?}");
     }
 
     #[tokio::test]

@@ -4,9 +4,13 @@ use cdk_sql_common::stmt::{Column, Statement};
 use futures_util::future::{try_join, try_join_all};
 use futures_util::{pin_mut, TryStreamExt};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Error as PgError};
+use tokio_postgres::{Client, Error as PgError, Statement as PgStatement};
 
+use crate::cache::StatementCache;
 use crate::value::PgValue;
+
+/// A connection's prepared statements, by SQL text.
+pub(crate) type Statements = StatementCache<PgStatement>;
 
 #[inline(always)]
 fn to_pgsql_error(err: PgError) -> Error {
@@ -24,6 +28,41 @@ fn to_pgsql_error(err: PgError) -> Error {
     Error::Database(Box::new(err))
 }
 
+/// Returns the prepared statement for `sql`, preparing it on this connection the first time.
+async fn prepare_cached(
+    conn: &Client,
+    statements: &Statements,
+    sql: &str,
+) -> Result<PgStatement, Error> {
+    if let Some(prepared) = statements.get(sql) {
+        return Ok(prepared);
+    }
+    let prepared = conn.prepare(sql).await.map_err(to_pgsql_error)?;
+    Ok(statements.insert(sql, prepared))
+}
+
+/// Maps a statement's error, and forgets the statement if the server won't run it as prepared
+/// any more: its result columns changed under it (`cached plan must not change result type`,
+/// after another mint migrated a shared database), or the server no longer has it. The request
+/// fails, and the next one prepares the statement again. No retry: in a transaction, the error
+/// has already aborted it. 0A000 also means other unsupported features; forgetting the
+/// statement then only costs a prepare.
+fn forget_if_stale<'a>(
+    statements: &'a Statements,
+    sql: &'a str,
+) -> impl FnOnce(PgError) -> Error + 'a {
+    move |err| {
+        let stale = err.code().is_some_and(|code| {
+            *code == SqlState::FEATURE_NOT_SUPPORTED
+                || *code == SqlState::INVALID_SQL_STATEMENT_NAME
+        });
+        if stale {
+            statements.remove(sql);
+        }
+        to_pgsql_error(err)
+    }
+}
+
 #[inline(always)]
 pub async fn pg_batch(conn: &Client, statement: Statement) -> Result<(), Error> {
     let (sql, _placeholder_values) = statement.to_sql()?;
@@ -32,9 +71,13 @@ pub async fn pg_batch(conn: &Client, statement: Statement) -> Result<(), Error> 
 }
 
 #[inline(always)]
-pub async fn pg_execute(conn: &Client, statement: Statement) -> Result<usize, Error> {
+pub async fn pg_execute(
+    conn: &Client,
+    statements: &Statements,
+    statement: Statement,
+) -> Result<usize, Error> {
     let (sql, placeholder_values) = statement.to_sql()?;
-    let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+    let prepared_statement = prepare_cached(conn, statements, &sql).await?;
 
     run_db_operation(
         &sql,
@@ -49,7 +92,7 @@ pub async fn pg_execute(conn: &Client, statement: Statement) -> Result<usize, Er
             .await
             .map(|x| x as usize)
         },
-        to_pgsql_error,
+        forget_if_stale(statements, &sql),
     )
     .await
 }
@@ -62,6 +105,7 @@ pub async fn pg_execute(conn: &Client, statement: Statement) -> Result<usize, Er
 /// transaction and answers the COMMIT with a rollback, and the statement's error is returned.
 pub async fn pg_execute_then_commit(
     conn: &Client,
+    prepared_statements: &Statements,
     statements: Vec<Statement>,
 ) -> Result<(), Error> {
     // `try_join_all` polls up to 30 futures in order, and so sends their requests in order;
@@ -70,7 +114,7 @@ pub async fn pg_execute_then_commit(
     const PIPELINED_MAX: usize = 30;
     if statements.len() > PIPELINED_MAX {
         for statement in statements {
-            pg_execute(conn, statement).await?;
+            pg_execute(conn, prepared_statements, statement).await?;
         }
         return run_db_operation("COMMIT", conn.batch_execute("COMMIT"), to_pgsql_error).await;
     }
@@ -78,7 +122,7 @@ pub async fn pg_execute_then_commit(
     let mut prepared = Vec::with_capacity(statements.len());
     for statement in statements {
         let (sql, placeholder_values) = statement.to_sql()?;
-        let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+        let prepared_statement = prepare_cached(conn, prepared_statements, &sql).await?;
         prepared.push((sql, prepared_statement, placeholder_values));
     }
 
@@ -94,7 +138,7 @@ pub async fn pg_execute_then_commit(
                         .map(|x| x.into())
                         .collect::<Vec<PgValue>>(),
                 ),
-                to_pgsql_error,
+                forget_if_stale(prepared_statements, sql),
             )
         });
     let commit = run_db_operation("COMMIT", conn.batch_execute("COMMIT"), to_pgsql_error);
@@ -106,10 +150,11 @@ pub async fn pg_execute_then_commit(
 #[inline(always)]
 pub async fn pg_fetch_one(
     conn: &Client,
+    statements: &Statements,
     statement: Statement,
 ) -> Result<Option<Vec<Column>>, Error> {
     let (sql, placeholder_values) = statement.to_sql()?;
-    let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+    let prepared_statement = prepare_cached(conn, statements, &sql).await?;
 
     run_db_operation(
         &sql,
@@ -136,15 +181,19 @@ pub async fn pg_fetch_one(
                 })
                 .transpose()
         },
-        to_pgsql_error,
+        forget_if_stale(statements, &sql),
     )
     .await
 }
 
 #[inline(always)]
-pub async fn pg_fetch_all(conn: &Client, statement: Statement) -> Result<Vec<Vec<Column>>, Error> {
+pub async fn pg_fetch_all(
+    conn: &Client,
+    statements: &Statements,
+    statement: Statement,
+) -> Result<Vec<Vec<Column>>, Error> {
     let (sql, placeholder_values) = statement.to_sql()?;
-    let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+    let prepared_statement = prepare_cached(conn, statements, &sql).await?;
 
     run_db_operation(
         &sql,
@@ -172,15 +221,19 @@ pub async fn pg_fetch_all(conn: &Client, statement: Statement) -> Result<Vec<Vec
 
             Ok(rows)
         },
-        to_pgsql_error,
+        forget_if_stale(statements, &sql),
     )
     .await
 }
 
 #[inline(always)]
-pub async fn pg_pluck(conn: &Client, statement: Statement) -> Result<Option<Column>, Error> {
+pub async fn pg_pluck(
+    conn: &Client,
+    statements: &Statements,
+    statement: Statement,
+) -> Result<Option<Column>, Error> {
     let (sql, placeholder_values) = statement.to_sql()?;
-    let prepared_statement = conn.prepare(&sql).await.map_err(to_pgsql_error)?;
+    let prepared_statement = prepare_cached(conn, statements, &sql).await?;
 
     run_db_operation(
         &sql,
@@ -203,7 +256,7 @@ pub async fn pg_pluck(conn: &Client, statement: Statement) -> Result<Option<Colu
                 .map(|row| row.try_get::<_, PgValue>(0).map(|value| value.into()))
                 .transpose()
         },
-        to_pgsql_error,
+        forget_if_stale(statements, &sql),
     )
     .await
 }
